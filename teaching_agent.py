@@ -5,16 +5,20 @@ LangChain 教学版 Agent
 依赖：pip install langchain langchain-core langchain-deepseek
 ============================================================
 """
-
+from typing import ClassVar, Dict
 import os
 import math
 import json
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from typing import Any
 
+from dotenv import load_dotenv
+
 # ===================== 1. 标准 Tool 基类 =====================
+load_dotenv()
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
@@ -115,11 +119,11 @@ class UnitConvertTool(StandardTool):
     )
 
     # 换算表（都以基准单位存储）
-    LENGTH_TO_METER = {
+    LENGTH_TO_METER: ClassVar[Dict[str, float]] = {
         "km": 1000, "m": 1, "cm": 0.01, "mm": 0.001,
         "mile": 1609.344, "feet": 0.3048, "inch": 0.0254,
     }
-    WEIGHT_TO_KG = {
+    WEIGHT_TO_KG: ClassVar[Dict[str, float]] = {
         "kg": 1, "g": 0.001, "mg": 0.000001,
         "lb": 0.453592, "oz": 0.0283495,
     }
@@ -264,50 +268,65 @@ class JsonFormatterTool(StandardTool):
 
 
 class WebSearchTool(StandardTool):
-    """网络搜索（DuckDuckGo Instant Answer API）"""
+    """网络搜索（Tavily API）"""
     name: str = "web_search"
     description: str = (
-        "网络搜索工具。输入搜索关键词，返回简要摘要和前几条相关结果。"
-        "适合查找事实、概念解释、近期事件或资料来源。"
+        "网络搜索工具（Tavily）。输入搜索关键词，返回简要摘要和前几条相关结果。"
+        "需要设置环境变量 TAVILY_API_KEY。"
     )
 
     def _run(self, query: str) -> str:
         if not query.strip():
             return "请输入要搜索的关键词"
 
-        params = urllib.parse.urlencode({
-            "q": query,
-            "format": "json",
-            "no_html": "1",
-            "skip_disambig": "1",
-        })
-        url = f"https://api.duckduckgo.com/?{params}"
+        api_key = os.getenv("TAVILY_API_KEY", "").strip()
+        if not api_key:
+            return "搜索失败：未设置 TAVILY_API_KEY 环境变量"
+
+        payload = json.dumps(
+            {
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 5,
+                "include_answer": True,
+                "include_raw_content": False,
+                "include_images": False,
+            }
+        ).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; TeachingAgent/1.0)",
+            },
+            method="POST",
+        )
 
         try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
-            abstract = data.get("AbstractText", "").strip()
-            results = []
-
-            for item in data.get("RelatedTopics", []):
-                if isinstance(item, dict) and "Text" in item and "FirstURL" in item:
-                    results.append((item["Text"], item["FirstURL"]))
-                if "Topics" in item:
-                    for sub in item.get("Topics", []):
-                        if "Text" in sub and "FirstURL" in sub:
-                            results.append((sub["Text"], sub["FirstURL"]))
-                if len(results) >= 5:
-                    break
+            answer = (data.get("answer") or "").strip()
+            results = data.get("results", []) or []
 
             lines = []
-            if abstract:
-                lines.append(f"摘要：{abstract}")
+            if answer:
+                lines.append(f"摘要：{answer}")
 
             if results:
                 lines.append("相关结果：")
-                for i, (text, link) in enumerate(results[:5], 1):
-                    lines.append(f"  {i}. {text} - {link}")
+                for i, item in enumerate(results[:5], 1):
+                    title = (item.get("title") or "").strip()
+                    url = (item.get("url") or "").strip()
+                    snippet = (item.get("content") or "").strip()
+                    text = title or snippet or "(无标题)"
+                    if url:
+                        lines.append(f"  {i}. {text} - {url}")
+                    else:
+                        lines.append(f"  {i}. {text}")
             else:
                 lines.append("未找到相关结果，建议换个关键词再试。")
 
@@ -316,7 +335,7 @@ class WebSearchTool(StandardTool):
             return f"搜索失败：{e}"
 
 
-# ===================== 3. 🎯 学生工具区 —— 只改这里！ =====================
+# ===================== 3. 🎯 工具区 —— 只改这里！ =====================
 # 把你写的工具实例加入这个列表就能跑：
 #   - 可以继承 StandardTool 自己写
 #   - 也可以用 @tool 装饰器快速创建
@@ -337,16 +356,30 @@ tools = [
 
 # ===================== 4. Agent 核心（不需要改动） =====================
 from langchain_deepseek import ChatDeepSeek
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
 # ----- 4.1 初始化 LLM -----
+# DeepSeek thinking 模式会要求回传 reasoning_content，这里补齐请求字段
+class ChatDeepSeekWithReasoning(ChatDeepSeek):
+    def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:
+        messages = self._convert_input(input_).to_messages()
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "messages" in payload:
+            for msg_dict, lc_msg in zip(payload["messages"], messages):
+                if msg_dict.get("role") == "assistant" and isinstance(lc_msg, AIMessage):
+                    reasoning_content = lc_msg.additional_kwargs.get("reasoning_content")
+                    if reasoning_content:
+                        msg_dict["reasoning_content"] = reasoning_content
+        return payload
+
 # 从环境变量读取 DeepSeek API Key，或在代码中直接设置
 # export DEEPSEEK_API_KEY="sk-xxxxx"
-llm = ChatDeepSeek(
-    model="deepseek-V4-flash",  
+llm = ChatDeepSeekWithReasoning(
+    model="deepseek-v4-pro",  
     temperature=0.3,         # 低温度让工具选择更稳定
-    api_key=os.getenv("DEEPSEEK_API_KEY", "your-api-key-here"),
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
 )
 
 # ----- 4.2 系统提示词 -----
@@ -382,6 +415,32 @@ def chat():
     print("=" * 60)
 
     config = {"configurable": {"thread_id": "teaching_session"}}
+    summary = ""
+    max_messages_before_compress = 24
+
+    def build_summary(messages: list) -> str:
+        dialogue_lines = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage) and msg.content:
+                dialogue_lines.append(f"用户：{msg.content}")
+            elif isinstance(msg, AIMessage) and msg.content:
+                dialogue_lines.append(f"助手：{msg.content}")
+
+        if not dialogue_lines:
+            return ""
+
+        summary_prompt = (
+            "请把以下对话压缩为简洁摘要，保留：关键事实、用户偏好、未完成事项、工具结论。\n"
+            "只输出摘要正文，不要加标题或多余说明。\n\n"
+            + "\n".join(dialogue_lines)
+        )
+        summary_result = llm.invoke(
+            [
+                {"role": "system", "content": "你是一个负责压缩对话上下文的助手。"},
+                {"role": "user", "content": summary_prompt},
+            ]
+        )
+        return (summary_result.content or "").strip()
 
     while True:
         try:
@@ -399,17 +458,41 @@ def chat():
                 continue
 
             print("🤖 Agent 思考中...")
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": user_input}]},
-                config=config,
-            )
+            input_messages = []
+            if summary:
+                input_messages.append(
+                    {
+                        "role": "system",
+                        "content": f"这是对话压缩摘要：\n{summary}\n请基于摘要继续对话。",
+                    }
+                )
+            input_messages.append({"role": "user", "content": user_input})
+            result = agent.invoke({"messages": input_messages}, config=config)
+
+            # 透明化显示工具调用过程
+            messages = result.get("messages", [])
+            for msg in messages:
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    print("\n🛠️ 工具调用：")
+                    for call in msg.tool_calls:
+                        name = call.get("name", "<unknown>")
+                        args = call.get("args", {})
+                        print(f"  - {name}({args})")
+                if isinstance(msg, ToolMessage):
+                    tool_name = msg.name or msg.additional_kwargs.get("name") or "<unknown>"
+                    print(f"  ↳ 结果[{tool_name}]：{msg.content}")
 
             # 取最后一条 AI 消息作为回复
-            messages = result.get("messages", [])
             for msg in reversed(messages):
-                if hasattr(msg, "type") and msg.type == "ai" and hasattr(msg, "content") and msg.content:
+                if isinstance(msg, AIMessage) and msg.content:
                     print(f"\n🤖 Agent：{msg.content}")
                     break
+
+            # 触发上下文压缩
+            if len(messages) >= max_messages_before_compress:
+                summary = build_summary(messages)
+                config["configurable"]["thread_id"] = str(uuid.uuid4())
+                print("\n🧠 已压缩上下文并开启新会话线程。")
 
         except KeyboardInterrupt:
             print("\n👋 再见！")

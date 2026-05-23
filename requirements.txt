@@ -1,0 +1,6 @@
+langchain_core==1.4.0
+langchain_deepseek==1.0.1
+langgraph==1.2.1
+pydantic==2.13.4
+tavily-python==0.5.4
+python-dotenv==1.0.1

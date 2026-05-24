@@ -77,8 +77,12 @@ def _parse_json(state: StoryState, content: str, context: str) -> dict:
 def _build_scene(state: StoryState, role: str, genre_hint: str) -> StoryState:
     trace(state, f"[Scene] 生成开场（{state['task_type']}）...")
     prompt = (
-        f"你是{role}，请生成一个{genre_hint}的开场与线索。\n"
+        f"你是{role}，请生成一个{genre_hint}的完整案件开场与线索。\n"
         f"灵感词：{state['seed']}\n"
+        "必须包含：案发时间、地点、受害者/目标、事件经过与关键反常点。\n"
+        "线索必须充足且能明显指向嫌疑人，难度偏易。\n"
+        "clue 用 2-3 条线索组成一段话，线索与嫌疑人要直接关联。\n"
+        "suspect 给出明确姓名/身份，并简要说明可疑之处。\n"
         "输出 JSON：{\"scene\":..., \"clue\":..., \"suspect\":...}"
     )
     result = _invoke_llm(
@@ -87,13 +91,22 @@ def _build_scene(state: StoryState, role: str, genre_hint: str) -> StoryState:
         "场景生成",
     )
     data = _parse_json(state, result.content, "场景生成")
-    state["scene"] = data["scene"]
-    state["clue"] = data["clue"]
-    suspect_value = data["suspect"]
+    scene_value = str(data.get("scene", "")).strip()
+    clue_value = str(data.get("clue", "")).strip()
+    suspect_value = data.get("suspect", "")
+    if not scene_value:
+        scene_value = f"{state['seed']}附近发生一起异常事件，但现场信息不足。"
+    if not clue_value:
+        clue_value = "线索不足：现场仅留下零散痕迹，尚需补充。"
     if isinstance(suspect_value, list):
-        state["suspect"] = "；".join(str(item) for item in suspect_value)
+        suspect_text = "；".join(str(item) for item in suspect_value)
     else:
-        state["suspect"] = str(suspect_value)
+        suspect_text = str(suspect_value).strip()
+    if not suspect_text:
+        suspect_text = "身份不明的可疑人（需根据补充线索锁定）"
+    state["scene"] = scene_value
+    state["clue"] = clue_value
+    state["suspect"] = suspect_text
     return state
 
 
